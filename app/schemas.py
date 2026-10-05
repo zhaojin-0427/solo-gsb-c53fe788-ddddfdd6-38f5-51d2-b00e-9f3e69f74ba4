@@ -21,6 +21,9 @@ class EventOut(BaseModel):
     # 载荷对象的内容地址（规范化 JSON 的 SHA-256）；旧数据迁移完成前可能为 None
     payload_digest: str | None = None
     created_at: datetime
+    # 撤销时刻；未撤销为 None。撤销为终态：重复撤销不刷新该时刻，重复提交
+    # 同 (source,event_id) 仍返回此事件且不复活投递。
+    cancelled_at: datetime | None = None
     duplicate: bool = False
 
 
@@ -115,7 +118,9 @@ class DeliveryOut(BaseModel):
     config_effective_at: datetime
     chain_id: int | None = None
     chain_seq: int
-    status: Literal["pending", "in_flight", "succeeded", "dead_lettered"]
+    status: Literal[
+        "pending", "in_flight", "succeeded", "dead_lettered", "cancelled"
+    ]
     attempts_made: int
     not_before: datetime
     leased_at: datetime | None

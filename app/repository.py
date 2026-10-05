@@ -460,7 +460,7 @@ async def find_event_by_key(
     """按业务键查重（状态机第 1 步）；返回行含 payload_digest/旧 payload。"""
     return await conn.fetchrow(
         """
-        SELECT id, source, event_id, payload, payload_digest, created_at
+        SELECT id, source, event_id, payload, payload_digest, created_at, cancelled_at
         FROM events WHERE source = $1 AND event_id = $2
         """,
         source,
@@ -579,7 +579,8 @@ async def finalize_event_submission(
             INSERT INTO events (source, event_id, payload, payload_digest)
             VALUES ($1, $2, NULL, $3)
             ON CONFLICT (source, event_id) DO NOTHING
-            RETURNING id, source, event_id, payload, payload_digest, created_at
+            RETURNING id, source, event_id, payload, payload_digest,
+                      created_at, cancelled_at
             """,
             source,
             event_id,
@@ -634,11 +635,104 @@ async def get_event(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, event_id, payload, payload_digest, created_at
+        SELECT id, source, event_id, payload, payload_digest, created_at, cancelled_at
         FROM events WHERE id = $1
         """,
         event_pk,
     )
+
+
+# -- 事件撤销 --------------------------------------------------------------------
+#
+# 撤销与认领/结算/重放的并发协调（关键不变式）：
+#
+# 锁：cancel_event 在单个事务内先以 FOR UPDATE 锁定事件行（事件行只被撤销
+# 事务加写锁；该锁是唯一的撤销边界栅栏），再把该事件的 pending 投递原子更新
+# 为 cancelled（UPDATE 只锁定满足 status='pending' 的投递行）。
+#
+# 为什么认领对事件行只做“不加锁的新鲜读”而不是 FOR UPDATE：
+# 认领事务的持锁顺序是 投递行(FOR UPDATE SKIP LOCKED) → 订阅行(FOR UPDATE)，
+# 若再 FOR UPDATE 事件行，就会与“持事件行锁、等待 pending 投递行”的撤销事务
+# 形成 认领(投递)→撤销(事件) 与 撤销(事件)→认领(投递) 的 AB-BA 环，被
+# Postgres 死锁检测回滚。改为普通 SELECT cancelled_at（READ COMMITTED 下
+# 每条语句都是最新已提交快照、且不与撤销事务互斥）后：
+# - 读到 cancelled_at 非空：撤销已提交 → 放弃认领（不产生租约）；
+# - 读到 NULL：撤销尚未提交 → 认领提交租约；若撤销事务正在等待该投递行，
+#   认领先提交后投递已是 in_flight，撤销的 pending 更新条件不再命中该行。
+#   线性顺序即“认领先于撤销”，属撤销响应前已存在的租约，允许其完成。
+# 撤销 UPDATE 在投递行上的等待只会发生在持锁事务（认领）不等待事件行的
+# 情况下，因此等待图无环、无死锁。
+#
+# 撤销时仍在飞行的 in_flight 投递（撤销不触碰它们）：
+# - 成功：settle 记 succeeded（撤销不抹掉撤销前已取得的成功）；
+# - 失败：settle 在投递行锁内新鲜读事件行 cancelled_at，非空则直接落
+#   cancelled，不回 pending、不重试、不进死信；
+# - 租约过期：认领候选显式排除“已撤销事件的 in_flight”，绝不重新发租约；
+#   Worker 每轮轮询先执行 sweep_cancelled_deliveries，把已撤销事件上租约
+#   过期的 in_flight（以及 settle 并发窗口中先被扫描、随后才回到 pending 的
+#   竞态残留）统一终结为 cancelled，状态快速收敛。
+#
+# 重放：replay_dead_letter 先锁原死信投递行（status='dead_lettered'，不匹配
+# 撤销的 pending 更新，故事件行锁等待无环），再 FOR UPDATE 锁事件行与撤销
+# 串行：撤销已提交则拒绝重放（409）；重放先提交则其新 pending 投递随后会被
+# 撤销事务（或 sweep）一并终结，重放不可能越过撤销。
+#
+# 幂等与保留：重复撤销命中已置位的事件行，changed=False 且不刷新
+# cancelled_at；未知事件返回 None（API 404）。succeeded/dead_lettered 记录、
+# delivery_attempts 尝试历史、事件载荷对象引用全部原样保留，GC 引用规则不变。
+
+async def cancel_event(
+    conn: asyncpg.Connection, event_pk: int
+) -> tuple[asyncpg.Record | None, bool]:
+    """原子撤销事件并终结其全部 pending 投递（单事务）。
+
+    返回 (事件行, 本次是否首次撤销)：
+    - 首次撤销：置 events.cancelled_at=now()，并把该事件所有 pending 投递
+      （含退避中等待重试者）原子转为 cancelled、清除租约字段；已终结
+      （succeeded/dead_lettered/cancelled）与撤销时仍在飞行（in_flight）的
+      投递不触碰（in_flight 由 settle/sweep 按 cancelled_at 兜底裁决）；
+    - 重复撤销：整操作幂等，返回同一事件行与 changed=False（不刷新时间戳）；
+    - 未知事件：返回 (None, False)（调用方据此返回 404）。
+    """
+    async with conn.transaction():
+        event = await conn.fetchrow(
+            """
+            SELECT id, source, event_id, payload, payload_digest,
+                   created_at, cancelled_at
+            FROM events
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            event_pk,
+        )
+        if event is None:
+            return None, False
+        if event["cancelled_at"] is not None:
+            return event, False
+
+        await conn.execute(
+            "UPDATE events SET cancelled_at = now() WHERE id = $1",
+            event_pk,
+        )
+        # 只锁定/更新 status='pending' 的投递行：in_flight 行可能正被某个
+        # 认领事务持有行锁（该事务对事件行只做不加锁新鲜读，不与本事务成
+        # 死锁环）；其提交后状态已不是 pending，条件不再命中。死信/成功等
+        # 终态行同样不锁定、不修改。
+        await conn.execute(
+            """
+            UPDATE deliveries
+            SET status = 'cancelled',
+                not_before = now(),
+                leased_at = NULL,
+                lease_expires_at = NULL,
+                leased_by = NULL,
+                updated_at = now()
+            WHERE event_id_fk = $1 AND status = 'pending'
+            """,
+            event_pk,
+        )
+        refreshed = await get_event(conn, event_pk)
+        return refreshed, True
 
 
 # -- Worker：认领队首任务 --------------------------------------------------------
@@ -663,18 +757,24 @@ async def _claim_select_candidate(
     # NOT EXISTS 保证严格顺序：前面还有未终结投递时不允许发送后续事件。
     # s.paused = FALSE 只是快速过滤（READ COMMITTED 语句快照可能读到旧状态）；
     # 权威的暂停裁决在下一步锁定订阅行后的复核，防止读到旧状态的认领越过边界。
+    # e.cancelled_at IS NULL 过滤掉已撤销事件：撤销后绝不产生新租约，也绝不
+    # 接管（接管等于对已撤销事件发一次新投递）。该过滤不加事件行锁，权威裁决
+    # 在 _claim_event_cancelled 的最新快照复核（撤销与认领的无死锁协调见
+    # “事件撤销”一节的锁说明）。
     return await conn.fetchrow(
         """
         SELECT d.id, d.event_id_fk, d.subscription_id, d.status,
                d.attempts_made, d.leased_by
         FROM deliveries d
         JOIN subscriptions s ON s.id = d.subscription_id
+        JOIN events e ON e.id = d.event_id_fk
         WHERE (
                 (d.status = 'pending' AND d.not_before <= $1)
              OR (d.status = 'in_flight' AND d.lease_expires_at < $1)
             )
           AND s.active = TRUE
           AND s.paused = FALSE
+          AND e.cancelled_at IS NULL
           AND NOT EXISTS (
                 SELECT 1
                 FROM deliveries earlier
@@ -687,6 +787,28 @@ async def _claim_select_candidate(
         FOR UPDATE OF d SKIP LOCKED
         """,
         now,
+    )
+
+
+async def _claim_event_cancelled(
+    conn: asyncpg.Connection, event_id_fk: int
+) -> bool | None:
+    """事件撤销边界的权威复核（不加锁的最新快照读）。
+
+    在已持有候选投递行锁与订阅行锁之后调用：
+    - 返回 None：事件行不存在（理论上不可能，投递有外键）；
+    - 返回 True：撤销已提交，调用方必须放弃认领（不产生租约）；
+    - 返回 False：撤销尚未提交，可继续认领。
+
+    刻意不使用 FOR UPDATE：认领已持有投递行锁，若再等事件行写锁，会与
+    “持事件行锁、更新 pending 投递行”的撤销事务成 AB-BA 死锁环。READ
+    COMMITTED 下普通 SELECT 读取该语句开始时最新已提交值，且不与撤销互斥：
+    撤销先提交则此处必见 cancelled_at；撤销未提交则本次认领先于撤销生效
+    （该已认领请求随后按 settle 的撤销裁决成功或转 cancelled）。
+    """
+    return await conn.fetchval(
+        "SELECT cancelled_at IS NOT NULL FROM events WHERE id = $1",
+        event_id_fk,
     )
 
 
@@ -754,6 +876,14 @@ async def claim_delivery(
             # 投递行锁，不写入任何租约。
             return None
 
+        # 撤销边界复核（不加锁新鲜读，见 _claim_event_cancelled 的锁说明）：
+        # 候选可能在被本事务锁定投递行后才由并发撤销终结——但撤销更新 pending
+        # 行需要该投递行锁，会阻塞直到本事务提交/回滚，因此此处读到 NULL 时
+        # 撤销必然尚未提交，认领可安全完成；读到非 NULL 则撤销已提交，放弃。
+        cancelled = await _claim_event_cancelled(conn, candidate["event_id_fk"])
+        if cancelled is None or cancelled:
+            return None
+
         updated = await _claim_mark_in_flight(
             conn,
             delivery_id=candidate["id"],
@@ -770,6 +900,52 @@ async def claim_delivery(
             "leased_at": now,
             "lease_expires_at": lease_expires,
         }
+
+
+async def sweep_cancelled_deliveries(
+    conn: asyncpg.Connection, now: datetime, *, limit: int = 100
+) -> int:
+    """终结已撤销事件上无法再正常结算的投递，返回本次终结的行数。
+
+    Worker 每轮轮询在认领前调用（幂等、行锁安全，可多 Worker 并发）：
+    - 租约已过期的 in_flight：其 Worker 已僵死或结果将因租约栅栏被丢弃，
+      认领候选显式排除了这些行（不会再发新租约/接管），此处直接转 cancelled；
+    - 已是 pending 的撤销事件投递：撤销扫描与并发认领存在竞态——认领事务先
+      锁投递行、随后 settle 失败把行放回 pending 时撤销可能刚扫描完毕，这类
+      残留由此收敛（settle 成功路径会直接记 succeeded，不经过 pending）。
+
+    未过期的 in_flight 不处理：请求仍在飞行，成功记 succeeded，待租约过期
+    或失败 settle 时再转 cancelled。不触碰其他事件的任何投递。
+    """
+    result = await conn.execute(
+        """
+        WITH due AS (
+            SELECT d.id
+            FROM deliveries d
+            JOIN events e ON e.id = d.event_id_fk
+            WHERE e.cancelled_at IS NOT NULL
+              AND (
+                    d.status = 'pending'
+                 OR (d.status = 'in_flight' AND d.lease_expires_at < $1)
+              )
+            ORDER BY d.id
+            LIMIT $2
+            FOR UPDATE OF d SKIP LOCKED
+        )
+        UPDATE deliveries d
+        SET status = 'cancelled',
+            not_before = now(),
+            leased_at = NULL,
+            lease_expires_at = NULL,
+            leased_by = NULL,
+            updated_at = now()
+        FROM due
+        WHERE d.id = due.id
+        """,
+        now,
+        limit,
+    )
+    return int(result.split()[-1])
 
 
 async def load_delivery_context(
@@ -882,12 +1058,19 @@ async def settle_delivery(
 
     成功 -> succeeded；失败且已达该投递所钉版本的 max_attempts -> dead_lettered；
     否则回到 pending 并设置指数退避时间。返回结算后的状态；租约失效返回 None。
+
+    事件已撤销时（投递行锁内对事件行做不加锁新鲜读，与认领复核同一协调方式）：
+    成功仍记 succeeded（撤销前已完成的成功不抹掉）；失败一律转 cancelled——
+    不回 pending、不重试、不进死信，即使未达 max_attempts。
     """
     async with conn.transaction():
         locked = await conn.fetchrow(
             """
-            SELECT attempts_made, leased_by FROM deliveries
-            WHERE id = $1 FOR UPDATE
+            SELECT d.attempts_made, d.leased_by, e.cancelled_at
+            FROM deliveries d
+            JOIN events e ON e.id = d.event_id_fk
+            WHERE d.id = $1
+            FOR UPDATE OF d
             """,
             delivery_id,
         )
@@ -896,6 +1079,8 @@ async def settle_delivery(
 
         if succeeded:
             status = "succeeded"
+        elif locked["cancelled_at"] is not None:
+            status = "cancelled"
         elif locked["attempts_made"] >= max_attempts:
             status = "dead_lettered"
         else:
@@ -1014,7 +1199,8 @@ async def replay_dead_letter(
     - use_current_version=True 时显式选用订阅当前版本。
 
     原投递为非死信状态时抛 ReplayError(not_dead_lettered)；链上已有活动投递时
-    抛 ReplayError(chain_busy)。返回新投递行（含 config_revision）。
+    抛 ReplayError(chain_busy)；事件已撤销时抛 ReplayError(event_cancelled)。
+    返回新投递行（含 config_revision）。
     """
     async with conn.transaction():
         original = await conn.fetchrow(
@@ -1031,6 +1217,16 @@ async def replay_dead_letter(
             raise LookupError("delivery not found")
         if original["status"] != "dead_lettered":
             raise ReplayError("not_dead_lettered", "只有死信状态的投递可以重放")
+
+        # 锁事件行与撤销事务串行（锁顺序：投递行 → 事件行；死信行不匹配撤销
+        # 的 pending 更新，故等待事件锁期间不会被撤销反向等待投递锁，无死锁环）。
+        # 撤销一旦提交，任何死信重放都被拒绝，已有死信记录本身原样保留。
+        event = await conn.fetchrow(
+            "SELECT cancelled_at FROM events WHERE id = $1 FOR UPDATE",
+            original["event_id_fk"],
+        )
+        if event is not None and event["cancelled_at"] is not None:
+            raise ReplayError("event_cancelled", "事件已撤销，不能重放其死信投递")
 
         busy = await conn.fetchval(
             """

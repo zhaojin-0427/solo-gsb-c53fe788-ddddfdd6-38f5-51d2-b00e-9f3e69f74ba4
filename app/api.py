@@ -42,7 +42,13 @@ from app.schemas import (
 
 router = APIRouter(prefix="/api/v1")
 
-VALID_STATUSES = {"pending", "in_flight", "succeeded", "dead_lettered"}
+VALID_STATUSES = {
+    "pending",
+    "in_flight",
+    "succeeded",
+    "dead_lettered",
+    "cancelled",
+}
 
 # 出站目标安全策略：进程级单例，配置来自环境变量（见 app/config.py）
 egress_policy = policy_from_env(settings.allowed_hosts, settings.allowed_cidrs)
@@ -132,6 +138,7 @@ async def _event_out(row: asyncpg.Record, *, duplicate: bool) -> EventOut:
         payload=payload,
         payload_digest=digest,
         created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
         duplicate=duplicate,
     )
 
@@ -181,6 +188,38 @@ async def get_event(event_pk: int) -> EventOut:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await repo.get_event(conn, event_pk)
+    if row is None:
+        raise HTTPException(status_code=404, detail="事件不存在")
+    try:
+        return await _event_out(row, duplicate=False)
+    except ObjectStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "payload_store_unavailable",
+                "message": f"事件载荷对象存储暂不可用: {exc}",
+            },
+        )
+
+
+@router.post("/events/{event_pk}/cancel", response_model=EventOut, tags=["events"])
+async def cancel_event(event_pk: int) -> EventOut:
+    """撤销事件（幂等）。
+
+    单事务原子完成：置 `events.cancelled_at`，并把该事件各订阅尚在 pending
+    的投递（含退避等待重试者）置为 `cancelled`。撤销响应成功后 Worker 不会
+    再为该事件产生任何新租约；撤销前已认领（in_flight）的请求仍可完成——
+    成功记 `succeeded`，失败或租约过期转 `cancelled`（不重试、不进死信）。
+    已撤销事件的死信重放一律 409 拒绝；已有成功/死信记录、尝试历史与载荷
+    引用全部保留；其他事件的投递顺序不受影响。
+
+    重复撤销返回 200 且 `cancelled_at` 保持首次时刻（幂等）；未知事件 404。
+    撤销后以同一 `(source, event_id)` 重复提交事件仍返回原事件（200，
+    `duplicate=true`），不会复活任何投递。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row, _changed = await repo.cancel_event(conn, event_pk)
     if row is None:
         raise HTTPException(status_code=404, detail="事件不存在")
     try:
@@ -565,7 +604,12 @@ async def replay_dead_letter(
         except LookupError:
             raise HTTPException(status_code=404, detail="投递不存在")
         except repo.ReplayError as exc:
-            status_code = 409 if exc.code in {"not_dead_lettered", "chain_busy"} else 400
+            status_code = (
+                409
+                if exc.code
+                in {"not_dead_lettered", "chain_busy", "event_cancelled"}
+                else 400
+            )
             raise HTTPException(status_code=status_code, detail=str(exc))
     return ReplayOut(
         replayed_from_delivery_id=delivery_id,

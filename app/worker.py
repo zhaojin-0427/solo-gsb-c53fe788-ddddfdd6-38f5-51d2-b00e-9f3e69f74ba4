@@ -269,6 +269,12 @@ async def _settle(
             delivery_id,
             context["max_attempts"],
         )
+    elif new_status == "cancelled":
+        log.warning(
+            "投递 id=%s 所属事件已撤销：本次失败（%s）终结为 cancelled，不再重试",
+            delivery_id,
+            outcome,
+        )
     else:
         log.info(
             "投递 id=%s 第 %s 次失败（%s），退避后重试",
@@ -276,6 +282,22 @@ async def _settle(
             attempt_number,
             outcome,
         )
+
+
+async def sweep_cancelled(pool) -> None:
+    """终结已撤销事件上租约过期的 in_flight / 竞态残留 pending 投递。
+
+    撤销不会为这些投递再产生新租约（认领候选显式排除）；它们只能靠本扫描
+    收敛。每轮轮询在认领前执行一次（幂等、FOR UPDATE SKIP LOCKED 可并发）。
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with pool.acquire() as conn:
+            n = await repo.sweep_cancelled_deliveries(conn, now)
+        if n:
+            log.info("撤销回收：本轮终结 %s 条已撤销事件投递为 cancelled", n)
+    except Exception:  # noqa: BLE001 - 回收失败不应影响投递主循环
+        log.exception("撤销回收扫描失败")
 
 
 async def run() -> None:
@@ -308,6 +330,7 @@ async def run() -> None:
         try:
             while not stop.is_set():
                 try:
+                    await sweep_cancelled(pool)
                     handled = await handle_one(pool, client, payload_store)
                 except Exception:  # noqa: BLE001 - Worker 主循环不能因单任务退出
                     log.exception("处理投递时发生未预期错误")

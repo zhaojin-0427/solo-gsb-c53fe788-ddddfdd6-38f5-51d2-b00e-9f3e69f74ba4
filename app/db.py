@@ -292,8 +292,16 @@ def _schema_statements(
             event_id    TEXT NOT NULL,
             payload     JSONB,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- 撤销时刻；NULL 表示事件未撤销。撤销为终态：只置位一次（重复撤销
+            -- 幂等且不刷新该时刻），撤销后同 (source,event_id) 重复提交仍返回
+            -- 原事件，不复活任何投递（事件行与载荷引用永久保留）。
+            cancelled_at TIMESTAMPTZ,
             UNIQUE (source, event_id)
         )
+        """,
+        # 旧库升级：幂等补充撤销时刻列（旧事件默认未撤销）。
+        """
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ
         """,
         # 旧库升级：新模型下载荷本体移到对象存储，payload JSONB 仅承载旧数据，
         # 新事件该列为 NULL，故放宽历史 NOT NULL 约束。
@@ -314,8 +322,7 @@ def _schema_statements(
             chain_id           BIGINT NOT NULL,
             chain_seq          INTEGER NOT NULL,
             seq                BIGINT NOT NULL DEFAULT nextval('delivery_seq_global'),
-            status             TEXT NOT NULL CHECK (status IN
-                                 ('pending', 'in_flight', 'succeeded', 'dead_lettered')),
+            status             TEXT NOT NULL DEFAULT 'pending',
             attempts_made      INTEGER NOT NULL DEFAULT 0,
             not_before         TIMESTAMPTZ NOT NULL DEFAULT now(),
             leased_at          TIMESTAMPTZ,
@@ -330,6 +337,38 @@ def _schema_statements(
         """
         ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS config_version_id BIGINT
             REFERENCES subscription_versions(id)
+        """,
+        # 撤销终态：pending 投递随事件撤销原子转 cancelled；撤销前已认领
+        # （in_flight）的请求若失败或租约过期，同样以 cancelled 终结（不重试、
+        # 不进死信）。旧约束由 Postgres 自动命名 deliveries_status_check，
+        # 先 DROP IF EXISTS 再用 DO 块守卫重建（与 outcome 约束同一升级模式）。
+        """
+        ALTER TABLE deliveries
+            DROP CONSTRAINT IF EXISTS deliveries_status_check
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'deliveries'::regclass
+                  AND conname = 'deliveries_status_check'
+            ) THEN
+                ALTER TABLE deliveries
+                    ADD CONSTRAINT deliveries_status_check
+                    CHECK (status IN
+                        ('pending', 'in_flight', 'succeeded',
+                         'dead_lettered', 'cancelled'));
+            END IF;
+        END$$
+        """,
+        # Reaper 扫描已撤销事件上租约过期的 in_flight / 残留 pending
+        # （sweep_cancelled_deliveries）：投递量是工作集小表，JOIN events
+        # 走主键即可；不能用带子查询的部分索引谓词（Postgres 不支持），
+        # 认领主路径仍由 idx_deliveries_sub_status_seq 支持。
+        """
+        CREATE INDEX IF NOT EXISTS idx_deliveries_status_expiry
+            ON deliveries (status, lease_expires_at)
         """,
         # 防止事件首次提交时为同一订阅重复建投递；重放（chain_seq>1）不受此约束。
         # 顺带移除早期版本的全量唯一索引（会阻止重放）。
