@@ -32,6 +32,17 @@
   阻止建投递的 `active` 标志），恢复后沿原 `seq`、退避 `not_before` 与尝试
   次数继续；严格顺序、死信重放语义不变。订阅查询（详情/列表）返回暂停状态。
   详见下文[“订阅暂停与恢复”](#订阅暂停与恢复)。
+- **事件撤销（cancel）**：`POST /api/v1/events/{id}/cancel` 在单事务内原子
+  标记撤销时刻（`cancelled_at`）并把该事件各订阅的 **pending 投递置为终态
+  `cancelled`**。撤销响应成功后 Worker 绝不会再为该事件产生新租约（撤销与
+  认领按“事件行 → 订阅行 → 投递行”锁序串行）；撤销前**已认领（in_flight）
+  的请求仍可完成**——成功仍记 `succeeded`，失败或租约过期则转 `cancelled`，
+  不再重试、不入死信。撤销后该事件的**死信重放被拒绝（409）**；已有成功、
+  死信、每次尝试历史与载荷对象引用全部保留，**其他事件仍按原顺序投递**。
+  重复撤销幂等，未知事件 404；撤销后以同一 `source/event_id` 重复提交只
+  返回原事件（带 `cancelled_at`），**不复活任何投递**。事件查询返回撤销
+  时刻，投递查询展示 `cancelled` 终态。
+  详见下文[“事件撤销”](#事件撤销)。
 - **HMAC 签名**：每次投递携带时间戳签名头
   `X-Webhook-Signature: t=<unix秒>,v1=<HMAC-SHA256 hex>`，签名内容为
   `<timestamp>.<紧凑排序 JSON 载荷>`；密钥取自该投递钉住的配置版本。
@@ -288,6 +299,145 @@ HTTP/1.1 404 Not Found
 投递并固定提交时刻的配置版本；暂停期间发布新版本、死信重放（重放同样只
 新建 pending 链记录）也都正常工作，恢复后严格顺序语义不变。
 
+### 事件撤销
+
+`POST /api/v1/events/{event_pk}/cancel` 撤销一个事件（无需请求体）。仓储在
+**单事务**内完成：给事件行写入撤销时刻 `events.cancelled_at`，并把该事件在
+各订阅上仍是 `pending`（等待/退避中）的投递原子翻转为终态 `cancelled`。
+
+行为约定：
+
+- **撤销响应成功后，Worker 绝不会再为该事件产生新租约**（含过期租约接管）；
+- 撤销**前已认领（`in_flight`）的 HTTP 请求允许飞完**：目标返回成功仍结算
+  为 `succeeded`；请求失败、或其租约已过期被接管，则结算为 `cancelled`，
+  **不再退避重试、不进入死信**；
+- 已是 `succeeded` / `dead_lettered` 的投递、每次尝试历史（attempts）、事件
+  载荷及其对象存储引用**全部原样保留**（撤销不删载荷，可继续在 MinIO 桶中
+  浏览）；`cancelled` 是终态，不阻挡同订阅后续事件——**其他事件严格顺序不变**；
+- 撤销后该事件的死信重放被拒绝（`409`）；
+- **重复撤销幂等**：返回同一个 `cancelled_at`（HTTP 200，不刷新时间戳）；
+  未知事件返回 `404`；
+- 撤销后用同一 `(source, event_id)` 重新提交事件，仍只返回原事件
+  （HTTP 200、`duplicate: true`、带 `cancelled_at`），**不会新建或复活投递**。
+
+```bash
+# 提交事件（订阅可能有多个；pending 的投递会在撤销时一起取消）
+$ curl -s -X POST localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"evt-1002","payload":{"order":43}}'
+{
+    "id": 2,
+    "source": "orders",
+    "event_id": "evt-1002",
+    "payload": {"order": 43},
+    "payload_digest": "61c746a80ce57e32e9f79c4d94b14626cbbc38b82c29e84f05591bd294fd43ed",
+    "created_at": "2026-10-05T10:00:00.000000Z",
+    "cancelled_at": null,
+    "duplicate": false
+}
+
+# 撤销（首次 200；重复调用返回同一 cancelled_at，也是 200）
+$ curl -s -X POST localhost:8000/api/v1/events/2/cancel | python3 -m json.tool
+{
+    "id": 2,
+    "source": "orders",
+    "event_id": "evt-1002",
+    "payload_digest": "61c746a80ce57e32e9f79c4d94b14626cbbc38b82c29e84f05591bd294fd43ed",
+    "created_at": "2026-10-05T10:00:00.000000Z",
+    "cancelled_at": "2026-10-05T10:00:05.123456Z"
+}
+
+# 再次撤销：幂等，时间戳不变
+$ curl -i -X POST localhost:8000/api/v1/events/2/cancel
+HTTP/1.1 200 OK
+{"id":2,"source":"orders","event_id":"evt-1002","payload_digest":"61c746a80ce57e32e9f79c4d94b14626cbbc38b82c29e84f05591bd294fd43ed","created_at":"2026-10-05T10:00:00.000000Z","cancelled_at":"2026-10-05T10:00:05.123456Z"}
+
+# 未知事件：404
+$ curl -i -X POST localhost:8000/api/v1/events/999999/cancel
+HTTP/1.1 404 Not Found
+{"detail":"事件不存在"}
+
+# 事件查询显示撤销时刻（载荷仍可读）
+$ curl -s localhost:8000/api/v1/events/2 | python3 -m json.tool
+{
+    "id": 2,
+    "source": "orders",
+    "event_id": "evt-1002",
+    "payload": {"order": 43},
+    "payload_digest": "61c746a80ce57e32e9f79c4d94b14626cbbc38b82c29e84f05591bd294fd43ed",
+    "created_at": "2026-10-05T10:00:00.000000Z",
+    "cancelled_at": "2026-10-05T10:00:05.123456Z",
+    "duplicate": false
+}
+
+# 该事件的投递查询：pending 已为终态 cancelled；已成功的保持 succeeded
+$ curl -s localhost:8000/api/v1/events/2/deliveries | python3 -m json.tool
+[
+    {
+        "id": 7,
+        "event_id_fk": 2,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "evt-1002",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-05T09:00:00.000000Z",
+        "chain_id": 7,
+        "chain_seq": 1,
+        "status": "cancelled",
+        "attempts_made": 0,
+        "not_before": "2026-10-05T10:00:05.123456Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-05T10:00:00.000000Z",
+        "updated_at": "2026-10-05T10:00:05.123456Z"
+    }
+]
+
+# 也可在全局投递历史中按终态过滤
+curl -s 'localhost:8000/api/v1/deliveries?status=cancelled&source=orders'
+
+# 同一 source/event_id 重复提交：200、duplicate=true、仍带 cancelled_at，
+# 不新增/复活任何投递
+$ curl -s -X POST localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"evt-1002","payload":{"order":43}}'
+{
+    "id": 2, …, "cancelled_at": "2026-10-05T10:00:05.123456Z",
+    "duplicate": true
+}
+
+# 已撤销事件的死信重放：409（旧死信记录与尝试历史保留，仅拒绝新建重放链）
+$ curl -i -X POST localhost:8000/api/v1/dead-letters/9/replay
+HTTP/1.1 409 Conflict
+{"detail":"事件已撤销，其死信不允许重放"}
+```
+
+#### 撤销边界如何与认领 / 结算 / 重放串行
+
+撤销需要同时约束四类写操作，统一的加锁方向为
+**事件行（`events FOR UPDATE`）→ 订阅行（`subscriptions FOR UPDATE`，按 id
+排序）→ 投递行（`deliveries FOR UPDATE`）**，沿同一方向加锁不会成环：
+
+- **撤销 ↔ 认领**：撤销事务先锁事件行、再按 id 锁相关订阅行；认领事务持
+  “投递行（`SKIP LOCKED`）→ 订阅行”，在订阅行上与撤销严格串行。撤销先提交
+  则认领在提交租约前的撤销复核（读 `cancelled_at`）必命中，放弃租约并把
+  候选（连同该事件其余 pending / 过期 `in_flight` 投递）翻转成 `cancelled`；
+  认领先提交则租约已落库，撤销随后才拿订阅行锁——撤销响应在租约之后，该
+  请求属于“撤销前已认领”。因此**撤销响应成功与最后一条新租约之间有确定
+  先后**。撤销翻转 pending 行时用 `FOR UPDATE SKIP LOCKED` 跳过正被并发
+  认领持锁的行（该行由认领复核自行翻转），两边不形成锁等待环；
+- **撤销 ↔ 结算**：结算按“投递行 → 事件行”加锁，事件行锁与撤销互斥：
+  撤销先提交时，失败结算读到事件已撤销即落 `cancelled`（不退避/不重试/
+  不入死信），成功结算不受影响仍记 `succeeded`；
+- **撤销 ↔ 死信重放**：重放先锁死信投递行、再锁其事件行复核，事件已撤销
+  一律拒绝（`event_cancelled` → 409），不产生新链记录；重放先提交则其新建
+  的 pending 链记录会被随后的撤销一并翻转，旧死信记录保留；
+- **租约过期接管**本质是一条新的认领事务，同样被撤销复核拦截——过期
+  `in_flight` 不会被重新投递，而是直接转 `cancelled`（不新增尝试记录）。
+
 ## API 一览
 
 所有业务 API 前缀为 `/api/v1`，交互文档见 `/docs`。
@@ -295,8 +445,9 @@ HTTP/1.1 404 Not Found
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/events` | 提交/幂等提交事件；首次 201，重复 200 |
-| GET | `/events/{id}` | 查询事件 |
-| GET | `/events/{id}/deliveries` | 事件对应的所有投递 |
+| GET | `/events/{id}` | 查询事件（撤销后返回 `cancelled_at`） |
+| POST | `/events/{id}/cancel` | 撤销事件（幂等；pending 投递原子转 `cancelled`；未知事件 404） |
+| GET | `/events/{id}/deliveries` | 事件对应的所有投递（展示 `cancelled` 终态） |
 | POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活；同时生成 revision=1） |
 | GET | `/subscriptions?source=` | 列出订阅（含 `current_revision`，不含密钥） |
 | GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision` 与暂停状态，不含密钥） |
@@ -308,7 +459,7 @@ HTTP/1.1 404 Not Found
 | GET | `/deliveries/{id}` | 投递详情（含 `config_revision`、`config_effective_at`） |
 | GET | `/deliveries/{id}/attempts` | 每次尝试明细（状态码、响应摘要、错误、租约时间） |
 | GET | `/dead-letters?subscription_id=&source=` | 死信列表 |
-| POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
+| POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409；事件已撤销 409） |
 | GET | `/crypto/status` | 密钥环/迁移/轮换状态（只含 key_id，不含密钥材料） |
 | GET | `/payloads/status` | 载荷对象存储/去重/在线迁移/GC 状态（只含计数，不含载荷内容） |
 | GET | `/payloads/gc` | 垃圾回收总览（候选/到期数、宽限、最近运行；只读） |
@@ -316,7 +467,9 @@ HTTP/1.1 404 Not Found
 | GET | `/health` | 健康检查 |
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
-`succeeded`、`dead_lettered`。
+`succeeded`、`dead_lettered`、`cancelled`（事件撤销后的终态：撤销时仍
+pending，或撤销后在途请求失败/租约过期）。`/deliveries?status=cancelled`
+可按终态过滤。
 
 尝试结果（`outcome`）：`success`、`http_error`、`network_error`、`timeout`、
 `security_blocked`（出站安全策略拒绝）、`crypto_error`（订阅密钥不可用）、

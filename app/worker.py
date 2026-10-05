@@ -269,6 +269,13 @@ async def _settle(
             delivery_id,
             context["max_attempts"],
         )
+    elif new_status == "cancelled":
+        log.info(
+            "投递 id=%s 所属事件已撤销：第 %s 次尝试（%s）后转 cancelled，不再重试",
+            delivery_id,
+            attempt_number,
+            outcome,
+        )
     else:
         log.info(
             "投递 id=%s 第 %s 次失败（%s），退避后重试",

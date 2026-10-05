@@ -21,7 +21,21 @@ class EventOut(BaseModel):
     # 载荷对象的内容地址（规范化 JSON 的 SHA-256）；旧数据迁移完成前可能为 None
     payload_digest: str | None = None
     created_at: datetime
+    # 撤销时刻；未撤销为 None（撤销后重复提交同一 source/event_id 仍返回
+    # 该原事件，且不复活任何投递）
+    cancelled_at: datetime | None = None
     duplicate: bool = False
+
+
+class CancelEventOut(BaseModel):
+    """撤销事件响应：与事件查询同构（含撤销时刻），不返回载荷外的额外状态。"""
+
+    id: int
+    source: str
+    event_id: str
+    payload_digest: str | None = None
+    created_at: datetime
+    cancelled_at: datetime
 
 
 class SubscriptionCreate(BaseModel):
@@ -115,7 +129,9 @@ class DeliveryOut(BaseModel):
     config_effective_at: datetime
     chain_id: int | None = None
     chain_seq: int
-    status: Literal["pending", "in_flight", "succeeded", "dead_lettered"]
+    status: Literal[
+        "pending", "in_flight", "succeeded", "dead_lettered", "cancelled"
+    ]
     attempts_made: int
     not_before: datetime
     leased_at: datetime | None
@@ -128,7 +144,6 @@ class DeliveryOut(BaseModel):
 class ReplayRequest(BaseModel):
     # 默认沿用原投递版本；显式 true 时选用订阅当前版本
     use_current_version: bool = False
-
 
 class ReplayOut(BaseModel):
     replayed_from_delivery_id: int

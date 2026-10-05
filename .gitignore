@@ -9,11 +9,14 @@ __pycache__/
 .test-gc-pgdata/
 .test-pgdata-pause/
 .test-pgdata-pause-db/
+.test-pgdata-cancel/
+.test-pgdata-cancel-db/
 .gc-pgdata-*/
 .gc-store-*/
 .test-payloads/
 .test-payloads-crypto/
 .test-payloads-store/
+.test-payloads-cancel/
 .test-slow-migrator.py
 .local-payloads/
 test-*.log

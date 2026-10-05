@@ -49,6 +49,23 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 # - paused_at 记录最近一次进入暂停的时刻，resumed_at 记录最近一次恢复的时刻
 #   （暂停中为 NULL），仅作状态展示。
 #
+# 事件撤销（events.cancelled_at + deliveries.status='cancelled'，见
+# repository.cancel_event）：
+# - 撤销在单事务内给事件行打 cancelled_at 时间戳，并把该事件全部 pending
+#   投递原子置为终态 cancelled；succeeded/dead_lettered 历史与尝试记录保留；
+# - 撤销事务先锁事件行、再按 id 顺序锁相关订阅行（与认领事务的“投递行→
+#   订阅行”次序构成确定先后，同暂停边界）：撤销响应成功后不可能再产生该
+#   事件的新租约；撤销前已认领（in_flight）的请求可完成——成功仍记
+#   succeeded，失败（settle 在事件行锁复核到撤销）或租约过期（认领路径
+#   复核到撤销）一律转 cancelled，不再重试、不入死信；
+# - pending 翻转用 FOR UPDATE SKIP LOCKED 跳过正被并发认领持锁的行：
+#   该认领到订阅行锁后复核事件已撤销，会自行放弃租约并把候选行翻转，
+#   因而撤销 UPDATE 不会与认领形成锁等待环；
+# - 撤销后该事件的死信重放被拒（replay 锁事件行复核 cancelled_at）；
+#   重复提交同一 (source, event_id) 仍只返回原事件（带 cancelled_at），
+#   不新增/复活任何投递。其他事件的投递顺序不受影响（cancelled 是终态，
+#   不再阻挡后续事件）。
+#
 # HMAC 密钥信封加密（见 app/envelope.py、app/keyring.py）：
 # - 新版本的密钥以随机 DEK 经 AES-256-GCM 加密（AAD 绑定 subscription_id +
 #   version_id），DEK 再由本地密钥环主密钥包裹；数据库只存
@@ -300,6 +317,11 @@ def _schema_statements(
         """
         ALTER TABLE events ALTER COLUMN payload DROP NOT NULL
         """,
+        # 事件撤销：非 NULL 即事件已撤销（撤销时刻）；不引入布尔列，时间戳
+        # 同时作为撤销事实与查询展示字段（见文件头“事件撤销”说明）。
+        """
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ
+        """,
         # 事件载荷对象引用（内容寻址；旧库升级幂等补充，见文件头说明）
         *_payload_schema_statements(),
         # 投递链：重放时复用同一 chain_id，chain_seq 从 1 递增；链内严格有序
@@ -315,7 +337,8 @@ def _schema_statements(
             chain_seq          INTEGER NOT NULL,
             seq                BIGINT NOT NULL DEFAULT nextval('delivery_seq_global'),
             status             TEXT NOT NULL CHECK (status IN
-                                 ('pending', 'in_flight', 'succeeded', 'dead_lettered')),
+                                 ('pending', 'in_flight', 'succeeded',
+                                  'dead_lettered', 'cancelled')),
             attempts_made      INTEGER NOT NULL DEFAULT 0,
             not_before         TIMESTAMPTZ NOT NULL DEFAULT now(),
             leased_at          TIMESTAMPTZ,
@@ -343,6 +366,34 @@ def _schema_statements(
         """
         CREATE INDEX IF NOT EXISTS idx_deliveries_sub_status_seq
             ON deliveries (subscription_id, status, seq)
+        """,
+        # 事件撤销按事件翻投递（cancel_event 与重放查事件状态都走此索引）
+        """
+        CREATE INDEX IF NOT EXISTS idx_deliveries_event_status
+            ON deliveries (event_id_fk, status)
+        """,
+        # 旧库升级：deliveries.status 的 CHECK 需纳入 cancelled。旧约束名为
+        # Postgres 自动命名（deliveries_status_check），存在则替换；新建库
+        # 上面的 CREATE TABLE 已带新约束，DO 块守卫跳过 ADD。
+        """
+        ALTER TABLE deliveries
+            DROP CONSTRAINT IF EXISTS deliveries_status_check
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'deliveries'::regclass
+                  AND conname = 'deliveries_status_check'
+            ) THEN
+                ALTER TABLE deliveries
+                    ADD CONSTRAINT deliveries_status_check
+                    CHECK (status IN
+                        ('pending', 'in_flight', 'succeeded',
+                         'dead_lettered', 'cancelled'));
+            END IF;
+        END$$
         """,
         """
         CREATE TABLE IF NOT EXISTS delivery_attempts (
